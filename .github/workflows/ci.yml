@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+  pull_request:
+    paths-ignore:
+      - "**.md"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test and build
+    # One job on purpose: each macOS job starts its own runner, and macOS minutes cost the
+    # most. The image's default Xcode is used, so it stays matched to the installed simulators.
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Show the toolchain
+        run: |
+          xcodebuild -version
+          swift --version
+
+      - name: Run the BankTrackerCore tests
+        run: swift test --package-path BankTrackerCore
+
+      - name: Build the macOS app
+        run: >-
+          xcodebuild build -quiet
+          -project BankTracker.xcodeproj
+          -scheme BankTracker
+          -destination 'generic/platform=macOS'
+          -derivedDataPath build/DerivedData
+
+      - name: Build the iPhone and iPad app
+        run: >-
+          xcodebuild build -quiet
+          -project BankTracker.xcodeproj
+          -scheme BankTracker
+          -destination 'generic/platform=iOS Simulator'
+          -derivedDataPath build/DerivedData

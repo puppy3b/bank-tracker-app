@@ -1,0 +1,120 @@
+name: Release
+
+# Pushing a vX.Y.Z tag tests and builds the Mac app and publishes it as a GitHub release.
+# scripts/release.sh pushes the tag. A release published on GitHub's website with a new tag
+# works too; the app is attached to that release. The tag sets the app's version.
+#
+# Running the workflow by hand:
+#   - with a tag: builds that tag and publishes it, for example to retry a failed release
+#   - without one: a test build from the chosen branch, kept as a workflow artifact for a week
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build and publish, like v0.2.0. Leave empty for a test build that isn't published."
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.event_name == 'push' && github.ref_name || inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build and publish
+    runs-on: macos-26
+    timeout-minutes: 30
+    env:
+      # The tag to publish; empty for a test build.
+      RELEASE_TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.RELEASE_TAG != '' && format('refs/tags/{0}', env.RELEASE_TAG) || github.ref }}
+
+      - name: Show the toolchain
+        run: |
+          xcodebuild -version
+          swift --version
+
+      - name: Read the app version
+        id: version
+        run: |
+          project_version="$(sed -n -E 's/.*MARKETING_VERSION = ([^;]+);.*/\1/p' BankTracker.xcodeproj/project.pbxproj | sort -u)"
+          if [[ -z "$project_version" || "$project_version" == *$'\n'* ]]; then
+            echo "::error::Couldn't read a single MARKETING_VERSION from the project: '$project_version'"
+            exit 1
+          fi
+          version="$project_version"
+          if [[ -n "$RELEASE_TAG" ]]; then
+            # The tag sets the version. It can leave out trailing zeros: v0.2 is version 0.2.0.
+            tag_version="${RELEASE_TAG#v}"
+            if [[ ! "$tag_version" =~ ^[0-9]+(\.[0-9]+){0,2}(-[0-9A-Za-z.-]+)?$ ]]; then
+              echo "::error::The tag $RELEASE_TAG isn't a version like v1.2.3, v1.2 or v1.2.3-beta.1."
+              exit 1
+            fi
+            core="${tag_version%%-*}"
+            suffix="${tag_version#"$core"}"
+            IFS=. read -r major minor patch <<<"$core"
+            version="$major.${minor:-0}.${patch:-0}$suffix"
+            if [[ "$version" != "$project_version" ]]; then
+              # Usual for a release published on GitHub's website, which doesn't change the project.
+              # Set the version in this checkout only; the build reads it from the project.
+              echo "::notice::Building $RELEASE_TAG as version $version. The project still says $project_version."
+              sed -i '' -E "s/([[:<:]]MARKETING_VERSION = )[^;]+;/\1$version;/" BankTracker.xcodeproj/project.pbxproj
+              set_version="$(sed -n -E 's/.*MARKETING_VERSION = ([^;]+);.*/\1/p' BankTracker.xcodeproj/project.pbxproj | sort -u)"
+              if [[ "$set_version" != "$version" ]]; then
+                echo "::error::Couldn't set the app version to $version in the project (it says '$set_version')."
+                exit 1
+              fi
+            fi
+          fi
+          echo "Version $version${RELEASE_TAG:+, tag $RELEASE_TAG}"
+          echo "version=$version" >>"$GITHUB_OUTPUT"
+
+      - name: Test, build and package
+        run: scripts/build-mac.sh --clean --test --zip
+
+      - name: Publish the release
+        if: env.RELEASE_TAG != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          assets=("build/BankTracker-$VERSION-macOS.zip" "build/BankTracker-$VERSION-macOS.zip.sha256")
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            # Already published, on GitHub's website or by an earlier run: attach the app, and
+            # write the notes only if the release has none.
+            gh release upload "$RELEASE_TAG" "${assets[@]}" --clobber
+            if [[ -z "$(gh release view "$RELEASE_TAG" --json body --jq .body)" ]]; then
+              {
+                cat .github/release-notes.md
+                echo
+                gh api "repos/$GITHUB_REPOSITORY/releases/generate-notes" -f tag_name="$RELEASE_TAG" --jq .body
+              } >"$RUNNER_TEMP/notes.md"
+              gh release edit "$RELEASE_TAG" --notes-file "$RUNNER_TEMP/notes.md"
+            fi
+          else
+            flags=(--title "Bank Tracker $VERSION" --notes-file .github/release-notes.md --generate-notes --verify-tag)
+            if [[ "$VERSION" == *-* ]]; then
+              flags+=(--prerelease)
+            fi
+            gh release create "$RELEASE_TAG" "${assets[@]}" "${flags[@]}"
+          fi
+          echo "Published $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/tag/$RELEASE_TAG"
+
+      - name: Keep the test build
+        if: env.RELEASE_TAG == ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: BankTracker-${{ steps.version.outputs.version }}-macOS
+          path: build/BankTracker-${{ steps.version.outputs.version }}-macOS.zip
+          retention-days: 7
+          if-no-files-found: error
